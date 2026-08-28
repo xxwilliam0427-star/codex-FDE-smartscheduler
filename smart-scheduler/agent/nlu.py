@@ -23,6 +23,7 @@ class Intent:
     days: List[str]                           # 涉及日期（周几）
     min_counts: Dict[Tuple[str, str], int]    # (日期, 班次) -> 最低人数
     exclude: List[str]                        # 明确不安排的员工
+    leave_updates: List[Dict[str, object]]    # 请假更新：[{"emp": "E03", "days": [...]}]
     schedule_text: Optional[str]              # check 模式下用户提供的排班文本
     raw: str
     notes: List[str] = field(default_factory=list)
@@ -54,8 +55,28 @@ _EXCLUDE_RE = re.compile(
     r"(?:不要安排|别安排|不安排|不要排|不排|排除|别排|避开|去掉)\s*(E\d+)|(E\d+)\s*(?:不要安排|别安排|不安排|不要排|不排|排除|别排)"
 )
 _SCHEDULE_LINE_RE = re.compile(
-    r"周([一二三四五六日天])\s*(早班|晚班)\s*(?:(\d+)\s*人)?\s*[:：]?\s*([A-Za-z0-9，,、\s]+)"
+    r"周([一二三四五六日天])\s*(早班|晚班)\s*(?:(\d+)\s*人)?\s*[:：]?\s*([A-Za-z0-9，,、\s]*[Ee]\d+[A-Za-z0-9，,、\s]*)"
 )
+
+_LEAVE_DAY_RE = re.compile(
+    r"([Ee]\d+)\s*周([一二三四五六日天])\s*(?:请假|来不了|不能来|不上班|休息|有事)|"
+    r"周([一二三四五六日天])\s*([Ee]\d+)\s*(?:请假|来不了|不能来|不上班|休息|有事)"
+)
+_LEAVE_WEEK_RE = re.compile(
+    r"([Ee]\d+)\s*(?:这周|本周|下周)?\s*(?:请假|来不了|不能来|不上班|休息|有事)|"
+    r"(?:请假|来不了|不能来|不上班|休息|有事)\s*(?:的是|的)?\s*([Ee]\d+)"
+)
+
+_MEANING_RE = re.compile(
+    r"排班|安排|排一下|生成|帮我排|排出|检查|校验|查一下|合规|冲突|"
+    r"周[一二三四五六日天]|\d+\s*人|[Ee]\d+|不要安排|不安排|排除|不排|别排|"
+    r"班次|早班|晚班|员工|请假|来不了|不能来|不上班|休息|有事|本周|这周|下周"
+)
+
+
+def looks_meaningful(text: str) -> bool:
+    """判断输入是否包含可识别的排班需求信号，避免无意义输入被默认排班。"""
+    return bool(_MEANING_RE.search(text))
 
 
 def _normalize_day(value: object) -> Optional[str]:
@@ -99,6 +120,23 @@ def _detect_action(text: str) -> str:
     return "generate"
 
 
+def _extract_leave_updates(text: str) -> List[Dict[str, object]]:
+    """提取「E03 请假 / E03 这周来不了 / E03周三请假」这类信息。"""
+    updates: Dict[str, List[str]] = {}
+    for m in _LEAVE_DAY_RE.finditer(text):
+        eid = (m.group(1) or m.group(4) or "").upper()
+        day = _day_key(m.group(2) or m.group(3))
+        if re.fullmatch(r"E\d+", eid):
+            updates.setdefault(eid, []).append(day)
+    for m in _LEAVE_WEEK_RE.finditer(text):
+        eid = (m.group(1) or m.group(2) or "").upper()
+        if not re.fullmatch(r"E\d+", eid):
+            continue
+        if eid not in updates:  # 已按具体日期登记的不再按整周处理
+            updates[eid] = list(DAYS)
+    return [{"emp": eid, "days": days} for eid, days in sorted(updates.items())]
+
+
 def parse_schedule_text(text: str) -> Tuple[Schedule, List[str]]:
     """把「周一早班：E01,E02,E03,E04」这类文本解析为排班对象。
 
@@ -129,6 +167,17 @@ def parse_schedule_text(text: str) -> Tuple[Schedule, List[str]]:
 def parse_local(text: str) -> Intent:
     """本地模板解析：不依赖大模型，覆盖常用表述。"""
     notes: List[str] = []
+    if not looks_meaningful(text):
+        return Intent(
+            action="clarify",
+            days=[],
+            min_counts={},
+            exclude=[],
+            leave_updates=[],
+            schedule_text=None,
+            raw=text,
+            notes=["无法识别为排班需求，请补充排班相关描述"],
+        )
     action = _detect_action(text)
     days = _extract_days(text)
     if days is None:
@@ -160,6 +209,8 @@ def parse_local(text: str) -> Intent:
         if eid and eid not in exclude:
             exclude.append(eid)
 
+    leave_updates = _extract_leave_updates(text)
+
     schedule_text = text if action == "check" else None
     if action == "check" and not _looks_like_schedule(text):
         notes.append("检查模式未识别到排班行，请按「周一早班：E01,E02,E03,E04」格式提供")
@@ -169,6 +220,7 @@ def parse_local(text: str) -> Intent:
         days=days,
         min_counts=min_counts,
         exclude=exclude,
+        leave_updates=leave_updates,
         schedule_text=schedule_text,
         raw=text,
         notes=notes,
@@ -179,7 +231,9 @@ def _build_llm_prompt(text: str, employees_summary: str, rules_summary: str) -> 
     schema = (
         '{"action": "generate 或 check", "days": ["周一", "周二"], '
         '"min_counts": {"周一": {"早班": 4, "晚班": 4}}, '
-        '"exclude": ["E03"], "schedule_text": "仅 check 模式下填用户提供的排班原文，否则为 null"}'
+        '"exclude": ["E03"], '
+        '"leave_updates": [{"emp": "E03", "days": ["周一", "周二"]}], '
+        '"schedule_text": "仅 check 模式下填用户提供的排班原文，否则为 null"}'
     )
     return (
         "你是一个排班需求解析器。用户会输入一句自然语言，你需要提取结构化参数，"
@@ -193,6 +247,8 @@ def _build_llm_prompt(text: str, employees_summary: str, rules_summary: str) -> 
         + "- min_counts：仅当用户明确要求某班次人数时填写（例如“早班4人”），其余用默认值"
         + "（周一至周五每班 4 人，周六日每班 6 人）。键为日期，值为 {\"早班\": 人数, \"晚班\": 人数}。\n"
         + "- exclude：用户明确说“不安排/排除”的员工 ID 列表，如 [\"E03\"]；没有则为 []。\n"
+        + "- leave_updates：用户提到某员工请假/来不了/休息/不上班时填写，days 为该员工请假的星期；"
+        + "未写具体日期或说“这周/本周”时列出全部 7 天；没有则为 []。\n"
         + "- schedule_text：action 为 \"check\" 时，原样保留用户粘贴的排班文本；否则为 null。\n\n"
         + "输出格式示例：\n"
         + schema
@@ -295,6 +351,22 @@ def _intent_from_llm(data: dict, raw: str) -> Intent:
         if re.fullmatch(r"E\d+", eid) and eid not in exclude:
             exclude.append(eid)
 
+    leave_updates: List[Dict[str, object]] = []
+    for upd in data.get("leave_updates", []) or []:
+        emp = str(upd.get("emp") or "").strip().upper()
+        if not re.fullmatch(r"E\d+", emp):
+            continue
+        days_raw = upd.get("days")
+        if not days_raw:
+            days = list(DAYS)
+        else:
+            days = []
+            for d in days_raw:
+                nd = _normalize_day(d)
+                if nd and nd not in days:
+                    days.append(nd)
+        leave_updates.append({"emp": emp, "days": days})
+
     schedule_text = None
     if action == "check" and data.get("schedule_text"):
         schedule_text = str(data["schedule_text"]).strip() or None
@@ -304,6 +376,7 @@ def _intent_from_llm(data: dict, raw: str) -> Intent:
         days=days,
         min_counts=min_counts,
         exclude=exclude,
+        leave_updates=leave_updates,
         schedule_text=schedule_text,
         raw=raw,
     )
@@ -319,6 +392,9 @@ def parse_intent(
     use_llm: bool = True,
 ) -> Tuple[Intent, str, List[str]]:
     """解析用户输入。返回 (意图, 解析模式["llm"/"local"], 注意事项)。"""
+    if not looks_meaningful(text):
+        intent = parse_local(text)
+        return intent, "local", list(intent.notes)
     if use_llm and api_key:
         try:
             data = call_llm_json(_build_llm_prompt(text, employees_summary, rules_summary), api_key, base_url, model)

@@ -8,8 +8,10 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import re
+import time
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -23,7 +25,7 @@ from agent.data_loader import (
     rules_summary_text,
 )
 from agent.explainer import build_schedule_explanation
-from agent.nlu import DEFAULT_BASE_URL, DEFAULT_MODEL, parse_intent, parse_schedule_text
+from agent.nlu import DEFAULT_BASE_URL, DEFAULT_MODEL, looks_meaningful, parse_intent, parse_schedule_text
 from agent.scheduler import default_min_counts, solve_schedule
 from agent.types import DAY_INDEX, DAYS, SHIFT_INDEX, SHIFTS, SHIFT_TIMES, Schedule
 from agent.validator import validate_schedule
@@ -34,7 +36,7 @@ st.set_page_config(
     page_title="智能排班助手",
     page_icon="💬",
     layout="centered",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 EMPLOYEES = load_employees()
@@ -78,107 +80,203 @@ _HERO = """
   <div class="hero-logo">💬</div>
   <h1>智能排班助手</h1>
   <p>像聊天一样排班：一句自然语言即可生成排班，<br>也可以粘贴已有排班进行规则检查。</p>
-  <p class="hero-sub">判断依据仅来自题目规则 R-01~R-09 与员工数据</p>
+  <p class="hero-sub">判断依据仅来自题目规则 R-01～R-09 与员工数据</p>
   <div class="hint">👇 试试下面的示例</div>
 </div>
 """
 
 _CSS = """
 <style>
+/* ============================================================
+   设计系统 Design Tokens
+   ============================================================ */
 :root {
-  --accent: #4f6ef7;
-  --accent2: #7c5cf0;
-  --bg: #eef1f8;
-  --line: #eceef5;
-  --text: #232837;
-}
-html, body, [data-testid="stAppViewContainer"] { background: var(--bg); }
-[data-testid="stHeader"] { display: none; }
-#MainMenu, footer { visibility: hidden; }
+  /* 品牌色（2 主色 + 1 强调色） */
+  --primary: #4d6bfe;
+  --primary-600: #3f5be8;
+  --primary-700: #334bd4;
+  --primary-soft: #eef2ff;
+  --accent: #8b5cf6;
+  --accent-soft: #f3eefe;
 
-/* 手机式固定布局：顶栏固定、消息区内部滚动、输入区吸底 */
+  /* 中性灰阶 */
+  --gray-100: #f8f9fa;
+  --gray-200: #e9ecef;
+  --gray-300: #ced4da;
+  --gray-400: #adb5bd;
+  --gray-500: #6c757d;
+  --gray-900: #212529;
+
+  --text: #212529;
+  --text-2: #6c757d;
+  --text-3: #adb5bd;
+  --line: rgba(0, 0, 0, 0.08);
+  --line-strong: rgba(0, 0, 0, 0.14);
+  --surface: rgba(255, 255, 255, 0.82);
+
+  /* 状态色板（浅底 + 深字） */
+  --success: #1a9e66; --success-bg: #e6f7ef; --success-line: rgba(26, 158, 102, 0.28);
+  --warning: #b45309; --warning-bg: #fff6e5; --warning-line: rgba(180, 83, 9, 0.28);
+  --danger:  #dc3545; --danger-bg:  #fdeeee; --danger-line:  rgba(220, 53, 69, 0.28);
+  --info:    #0d6efd; --info-bg:    #e7f0ff; --info-line:    rgba(13, 110, 253, 0.28);
+
+  /* 圆角体系：小元素 8 / 卡片 12 / 大容器 16 / 圆形 50% */
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-full: 50%;
+
+  /* 阴影层级 */
+  --shadow-sm: 0 1px 2px rgba(33, 37, 41, 0.06);
+  --shadow-md: 0 4px 12px rgba(33, 37, 41, 0.08);
+  --shadow-lg: 0 12px 32px rgba(33, 37, 41, 0.12);
+
+  /* 8px 网格 */
+  --sp-1: 8px;
+  --sp-2: 16px;
+  --sp-3: 24px;
+  --sp-4: 32px;
+  --sp-6: 48px;
+
+  /* 动效 */
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --dur: 0.25s;
+}
+
+/* ============================================================
+   全局基础
+   ============================================================ */
+html, body, [data-testid="stAppViewContainer"] {
+  background:
+    radial-gradient(900px 480px at 85% -10%, rgba(139, 92, 246, 0.14), transparent 60%),
+    radial-gradient(700px 420px at -10% 110%, rgba(77, 107, 254, 0.12), transparent 55%),
+    linear-gradient(135deg, #f8f9fa 0%, #eef1f8 100%);
+}
 html, body {
   height: 100% !important;
-  font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", "Source Sans", sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  color: var(--text);
 }
+[data-testid="stHeader"] { display: none; }
+#MainMenu, footer { visibility: hidden; }
 [data-testid="stApp"] { overflow: hidden !important; }
 [data-testid="stAppViewContainer"] { overflow: hidden !important; }
 [data-testid="stAppViewContainer"] > div { height: 100dvh !important; overflow: hidden !important; }
-[data-testid="stMain"] {
-  height: 100dvh !important;
-  min-height: 0 !important;
-  overflow: hidden !important;
-}
+[data-testid="stMain"] { height: 100dvh !important; min-height: 0 !important; overflow: hidden !important; }
+
+/* 主容器：毛玻璃卡片 */
 .block-container {
-  max-width: 430px;
+  max-width: 460px;
   height: 100dvh !important;
   min-height: 0 !important;
-  padding: 0.75rem 0.8rem 0.35rem;
-  background: #ffffff;
-  box-shadow: 0 0 60px rgba(30, 55, 120, 0.18), 0 0 0 1px rgba(30, 55, 120, 0.05);
+  padding: var(--sp-1) 12px 8px;
+  background: var(--surface);
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.65);
+  box-shadow: var(--shadow-lg);
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
 .block-container > [data-testid="stVerticalBlock"] {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
+  flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden;
 }
 div[data-testid="stLayoutWrapper"]:has(> .st-key-messages_area) {
-  flex: 1 1 0% !important;
-  min-height: 0 !important;
-  display: flex !important;
-  flex-direction: column;
-  overflow: hidden;
+  flex: 1 1 0% !important; min-height: 0 !important;
+  display: flex !important; flex-direction: column; overflow: hidden;
 }
-div[data-testid="stLayoutWrapper"]:has(> .st-key-input_area) {
-  flex: 0 0 auto !important;
-}
-/* 窄屏下列默认 min-width 为整行宽度，这里恢复按比例排列 */
+div[data-testid="stLayoutWrapper"]:has(> .st-key-input_area) { flex: 0 0 auto !important; }
 [data-testid="stColumn"] { min-width: 0 !important; }
-.st-key-messages_area { flex: 1; min-height: 0; overflow-y: auto; scrollbar-width: thin; padding: 4px 2px 8px; }
+
+/* 宽屏适配：主容器悬浮居中 */
+@media (min-width: 768px) {
+  .block-container { max-width: 720px; }
+}
+@media (min-width: 1024px) {
+  .block-container {
+    margin: var(--sp-3) auto;
+    height: calc(100dvh - 48px) !important;
+    border-radius: var(--r-lg);
+    border: 1px solid rgba(255, 255, 255, 0.70);
+  }
+}
+
+/* ============================================================
+   布局：消息区 / 输入区 / 滚动条
+   ============================================================ */
+.st-key-messages_area {
+  flex: 1; min-height: 0; overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(77, 107, 254, 0.40) transparent;
+  padding: 4px 2px var(--sp-2);
+}
+.st-key-messages_area::-webkit-scrollbar { width: 6px; }
+.st-key-messages_area::-webkit-scrollbar-track { background: transparent; }
+.st-key-messages_area::-webkit-scrollbar-thumb {
+  background: rgba(77, 107, 254, 0.35);
+  border-radius: 6px;
+}
 .st-key-input_area { flex: none; }
 
-/* 顶栏 */
-.app-title { font-size: 17px; font-weight: 800; color: #1f2430; }
-.pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
-.pill.on { background: #dcfce7; color: #15803d; }
-.pill.off { background: #f1f5f9; color: #64748b; }
+/* ============================================================
+   顶栏
+   ============================================================ */
+.app-title { font-size: 16px; font-weight: 700; letter-spacing: 0.1px; color: var(--text); }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: var(--r-sm);
+  font-size: 12px; font-weight: 600; line-height: 1.5;
+}
+.pill::before { content: ""; width: 6px; height: 6px; border-radius: var(--r-full); background: currentColor; }
+.pill.on { background: var(--success-bg); color: var(--success); }
+.pill.off { background: var(--gray-200); color: var(--text-2); }
 
-/* 按钮通用 */
+/* ============================================================
+   按钮体系（圆角 8px / 高度 40px）
+   ============================================================ */
 div[data-testid="stButton"] > button {
-  border-radius: 12px; border: 1px solid #e6e8f0; background: #fff; color: #4b5563;
-  font-weight: 500; min-height: 36px; box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
-  transition: all 0.15s ease;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line-strong);
+  background: #ffffff;
+  color: var(--text-2);
+  font-size: 14px;
+  font-weight: 500;
+  min-height: 40px;
+  box-shadow: var(--shadow-sm);
+  transition: all var(--dur) var(--ease);
 }
 div[data-testid="stButton"] > button:hover {
-  border-color: #c7d2fe; color: var(--accent); background: #f5f7ff; transform: translateY(-1px);
+  border-color: var(--primary);
+  color: var(--primary);
+  background: var(--primary-soft);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
 }
+div[data-testid="stButton"] > button:active { transform: translateY(0); box-shadow: var(--shadow-sm); }
 
-/* 聊天气泡 */
+/* ============================================================
+   对话气泡（15px 正文 / 不对称圆角 / 14px 18px 内边距）
+   ============================================================ */
 [data-testid="stChatMessage"] {
-  padding: 4px 0 16px; align-items: flex-start;
+  padding: 4px 0 14px;
+  align-items: flex-start;
   background: transparent !important;
+  animation: msgIn var(--dur) var(--ease);
 }
-[data-testid="stChatMessageContent"] [data-testid="stVerticalBlock"] > [data-testid="stElementContainer"] + [data-testid="stElementContainer"] {
-  margin-top: 8px;
-}
-[data-testid="stChatMessageContent"] [data-testid="stVerticalBlock"] [data-testid="stExpander"] {
-  margin-top: 8px;
-  border: none !important;
-  background: transparent !important;
-}
+[data-testid="stChatMessageContent"] [data-testid="stVerticalBlock"] > [data-testid="stElementContainer"] + [data-testid="stElementContainer"] { margin-top: 8px; }
+[data-testid="stChatMessageContent"] [data-testid="stVerticalBlock"] [data-testid="stExpander"] { margin-top: 4px; border: none !important; background: transparent !important; }
 
-/* 思考气泡 */
 .thinking-bubble {
   display: inline-flex; align-items: center; gap: 7px;
-  font-size: 14px; color: #6b7280; padding: 6px 4px;
+  font-size: 14px; color: var(--text-2); padding: 6px 4px;
 }
 .tdot {
-  width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+  width: 7px; height: 7px; border-radius: var(--r-full);
+  background: linear-gradient(180deg, var(--primary), var(--accent));
   animation: dotPulse 1.2s infinite ease-in-out;
 }
 .tdot:nth-child(2) { animation-delay: 0.15s; }
@@ -187,315 +285,587 @@ div[data-testid="stButton"] > button:hover {
   0%, 100% { opacity: 0.3; transform: translateY(0); }
   50% { opacity: 1; transform: translateY(-3px); }
 }
+@keyframes msgIn {
+  from { opacity: 0; transform: translateY(8px) scale(0.995); }
+  to { opacity: 1; transform: none; }
+}
+
 [data-testid="stChatMessage"]:has([aria-label="Chat message from user"]) { flex-direction: row-reverse; }
 [data-testid="stChatMessage"] > div:first-child {
-  width: 30px; height: 30px; border-radius: 50%;
+  width: 30px; height: 30px; border-radius: var(--r-full);
   display: flex; align-items: center; justify-content: center;
   font-size: 15px; flex-shrink: 0;
+  box-shadow: var(--shadow-sm);
 }
 [data-testid="stChatMessage"]:has([aria-label="Chat message from user"]) > div:first-child {
-  background: linear-gradient(135deg, var(--accent), var(--accent2)) !important;
+  background: linear-gradient(135deg, var(--primary), var(--accent)) !important;
 }
 [data-testid="stChatMessage"]:has([aria-label="Chat message from assistant"]) > div:first-child {
-  background: #eef0f6 !important;
+  background: var(--gray-200) !important;
 }
 [data-testid="stChatMessageContent"] {
-  width: fit-content !important; max-width: 84% !important; height: auto !important;
-  border-radius: 16px !important; padding: 10px 13px !important;
-  font-size: 14px; line-height: 1.65; word-break: break-word;
+  width: fit-content !important;
+  max-width: 84% !important;
+  height: auto !important;
+  border-radius: var(--r-lg) var(--r-lg) var(--r-lg) var(--r-sm) !important;
+  padding: 14px 18px !important;
+  font-size: 15px;
+  line-height: 1.6;
+  word-break: break-word;
 }
 [data-testid="stChatMessageContent"] > [data-testid="stVerticalBlock"],
 [data-testid="stChatMessageContent"] [data-testid="stElementContainer"] { height: auto !important; }
 [data-testid="stChatMessageContent"][aria-label="Chat message from user"] {
-  background: var(--accent) !important;
-  color: #fff !important; border-radius: 16px 16px 4px 16px !important;
-  box-shadow: 0 4px 14px rgba(79, 110, 247, 0.25);
+  background: linear-gradient(135deg, var(--primary), var(--accent)) !important;
+  color: #fff !important;
+  border-radius: var(--r-lg) var(--r-lg) var(--r-sm) var(--r-lg) !important;
+  box-shadow: 0 6px 18px rgba(77, 107, 254, 0.28);
 }
 [data-testid="stChatMessageContent"][aria-label="Chat message from assistant"] {
-  background: #fff !important; border: 1px solid #eef0f6 !important;
-  border-radius: 16px 16px 16px 4px !important; color: #232837;
-  box-shadow: 0 2px 8px rgba(30, 55, 120, 0.05);
+  background: rgba(255, 255, 255, 0.88) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: var(--r-lg) var(--r-lg) var(--r-lg) 4px !important;
+  color: var(--text);
+  box-shadow: var(--shadow-sm);
 }
 [data-testid="stChatMessageContent"] p {
   margin: 0 0 4px;
-  font-size: 14px !important;
-  line-height: 1.65 !important;
+  font-size: 15px !important;
+  line-height: 1.6 !important;
 }
-[data-testid="stChatMessageContent"] .stMarkdown > div {
-  align-items: flex-start !important;
-}
-[data-testid="stChatMessageContent"] [data-testid="stMarkdownContainer"] {
-  margin-bottom: 0 !important;
-}
+[data-testid="stChatMessageContent"] .stMarkdown > div { align-items: flex-start !important; }
+[data-testid="stChatMessageContent"] [data-testid="stMarkdownContainer"] { margin-bottom: 0 !important; }
 [data-testid="stChatMessageContent"] p:last-child { margin-bottom: 0; }
 [data-testid="stChatMessageContent"][aria-label="Chat message from user"] strong,
 [data-testid="stChatMessageContent"][aria-label="Chat message from user"] p,
 [data-testid="stChatMessageContent"][aria-label="Chat message from user"] div { color: #fff; }
 
-/* 输入区：圆角卡片 */
+/* ============================================================
+   输入区（玻璃卡片 / 12px 16px 内边距 / 主色聚焦光环）
+   ============================================================ */
 .st-key-input_area {
-  background: #ffffff;
-  border: 1px solid var(--line); border-radius: 20px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
   padding: 10px 12px 12px;
-  box-shadow: 0 -2px 18px rgba(26, 48, 110, 0.05), 0 6px 24px rgba(26, 48, 110, 0.10);
+  box-shadow: var(--shadow-md);
   margin-top: 6px;
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.st-key-input_area:focus-within {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(77, 107, 254, 0.25);
 }
 .st-key-input_area textarea {
-  border: none !important; background: transparent !important; box-shadow: none !important;
-  resize: none; font-size: 15px; line-height: 1.55;
+  border: none !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  resize: none;
+  font-size: 15px;
+  line-height: 1.55;
+  padding: 12px 16px;
 }
+.st-key-input_area textarea::placeholder { color: var(--gray-400); }
+.st-key-input_area .stChatInput { background: transparent; border: none; box-shadow: none; padding: 0; }
+div[data-testid="stChatInputSubmitButton"] {
+  background: linear-gradient(135deg, var(--primary), var(--accent)) !important;
+  border: none !important;
+  color: #fff !important;
+  box-shadow: 0 4px 14px rgba(77, 107, 254, 0.35);
+  transition: all var(--dur) var(--ease);
+}
+div[data-testid="stChatInputSubmitButton"]:hover {
+  filter: brightness(1.05);
+  box-shadow: 0 6px 18px rgba(77, 107, 254, 0.40);
+}
+[data-testid="stExpanderDetails"] { padding-bottom: 4px !important; }
 [data-testid="stTextArea"] { background: transparent; }
 [data-testid="stTextArea"] label { display: none !important; }
 
-/* 隐藏功能开关的“功能”标签 */
+/* ============================================================
+   功能开关（分段控件）
+   ============================================================ */
 [data-testid="stRadio"] [data-testid="stWidgetLabel"] { display: none !important; }
-
-/* 功能开关（生成 / 检查）——胶囊式单选 */
 [data-testid="stRadio"] {
-  background: #eef0f6; border-radius: 999px; padding: 3px;
-  height: 38px; display: flex; align-items: center;
+  background: var(--gray-100);
+  border-radius: var(--r-sm);
+  padding: 4px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--line);
 }
-[data-testid="stRadio"] [role="radiogroup"] {
-  gap: 3px; width: 100%; min-height: 0 !important; padding: 0 !important;
-}
+[data-testid="stRadio"] [role="radiogroup"] { gap: 4px; width: 100%; min-height: 0 !important; padding: 0 !important; }
 [data-testid="stRadio"] label {
-  border-radius: 999px; font-size: 13px; font-weight: 500;
-  padding: 0 12px !important; height: 32px; background: transparent; color: #64748b;
+  border-radius: var(--r-sm);
+  font-size: 14px; font-weight: 500;
+  padding: 0 12px !important; height: 30px;
+  background: transparent; color: var(--text-2);
   margin: 0; flex: 1; justify-content: center; min-height: 0 !important;
   display: flex; align-items: center;
-  transition: all 0.15s ease;
+  transition: all var(--dur) var(--ease);
 }
 [data-testid="stRadio"] label:has(input:checked) {
-  background: #eaf0ff !important;
-  color: var(--accent) !important;
-  font-weight: 700;
-  box-shadow: inset 0 0 0 1px rgba(79, 110, 247, 0.25), 0 2px 8px rgba(79, 110, 247, 0.15);
+  background: linear-gradient(135deg, var(--primary), var(--accent)) !important;
+  color: #fff !important;
+  font-weight: 600;
+  box-shadow: 0 4px 12px rgba(77, 107, 254, 0.30);
 }
 [data-testid="stRadio"] input[type="radio"] { display: none; }
 [data-testid="stRadio"] label > div:first-child { display: none; }
 [data-testid="stRadio"] [data-testid="stMarkdownContainer"] p { margin: 0; }
 
-/* 发送按钮 */
-div[data-testid="stElementContainer"].st-key-send_btn button {
-  background: var(--accent);
-  color: #fff; border: none; border-radius: 999px; font-weight: 700; min-height: 38px;
-  box-shadow: 0 4px 14px rgba(79, 110, 247, 0.30);
-}
-div[data-testid="stElementContainer"].st-key-send_btn button:hover {
-  filter: brightness(1.06); color: #fff; transform: none;
-}
-
-/* 排班表卡片 */
+/* ============================================================
+   排班表卡片（圆角 12 / 阴影 md / 渐变头部）
+   ============================================================ */
 .sched-card {
-  border: 1px solid #e8eaf2; border-radius: 14px; overflow: hidden;
-  margin: 6px 0 2px; background: #fff; box-shadow: 0 2px 12px rgba(26, 48, 110, 0.07);
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  overflow: hidden;
+  margin: 6px 0 2px;
+  background: #ffffff;
+  box-shadow: var(--shadow-md);
 }
 .sched-head {
   display: flex; justify-content: space-between; align-items: center;
-  background: var(--accent);
-  color: #fff; padding: 8px 12px; font-weight: 800; font-size: 14px;
+  background: linear-gradient(135deg, var(--primary), var(--accent));
+  color: #fff;
+  padding: 12px var(--sp-2);
+  font-weight: 700; font-size: 16px; letter-spacing: 0.1px;
 }
 .sched-badge {
-  background: rgba(255, 255, 255, 0.22); border-radius: 999px;
-  padding: 2px 9px; font-size: 11px; font-weight: 600;
+  background: rgba(255, 255, 255, 0.20);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: var(--r-sm);
+  padding: 2px 10px;
+  font-size: 12px; font-weight: 600;
 }
 table.sched-table { width: 100%; border-collapse: collapse; }
 .sched-table th {
-  font-size: 12px; color: #6b7280; padding: 8px 6px; text-align: left;
-  background: #fafbfe; border-bottom: 1px solid #eef0f6; font-weight: 600;
+  font-size: 12px; color: var(--text-2);
+  padding: 10px 8px; text-align: left;
+  background: var(--gray-100);
+  border-bottom: 1px solid var(--line);
+  font-weight: 600;
 }
-.sched-table td { padding: 7px 6px; border-bottom: 1px solid #f2f3f8; vertical-align: top; }
-.sched-table tr.weekend td { background: #fffaf0; }
+.sched-table td {
+  padding: 10px 8px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  transition: background var(--dur) var(--ease);
+}
+.sched-table tbody tr:hover td { background: var(--primary-soft); }
+.sched-table tr.weekend td { background: var(--warning-bg); }
+.sched-table tr.weekend:hover td { background: #fff3d6; }
 .sched-table tr:last-child td { border-bottom: none; }
-.day { font-weight: 800; color: #334155; font-size: 13px; white-space: nowrap; }
-tr.weekend .day { color: #d97706; }
-.shift-tag { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
-.shift-early { background: #fff3e0; color: #d97706; }
-.shift-late { background: #eef2ff; color: #4f46e5; }
-.emp { display: inline-block; margin: 0 3px 3px 0; padding: 2px 7px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+.day { font-weight: 700; color: var(--gray-900); font-size: 12px; white-space: nowrap; }
+tr.weekend .day { color: var(--warning); }
+.shift-tag {
+  display: inline-block; padding: 2px 9px;
+  border-radius: var(--r-sm);
+  font-size: 12px; font-weight: 600;
+}
+.shift-early { background: #fff3e0; color: var(--warning); }
+.shift-late { background: var(--primary-soft); color: var(--primary-700); }
+.emp {
+  display: inline-block; margin: 0 3px 3px 0; padding: 2px 8px;
+  border-radius: var(--r-sm);
+  font-size: 12px; font-weight: 600;
+  border: 1px solid transparent;
+}
 .emp-store { background: #fee2e2; color: #b91c1c; }
 .emp-vice { background: #fce7f3; color: #be185d; }
 .emp-super { background: #ede9fe; color: #6d28d9; }
 .emp-senior { background: #dbeafe; color: #1d4ed8; }
-.emp-clerk { background: #f1f5f9; color: #334155; }
+.emp-clerk { background: var(--gray-200); color: var(--gray-900); }
 .emp-part { background: #ccfbf1; color: #0f766e; }
-.emp-unknown { background: #fef3c7; color: #b45309; }
-.meta { margin-top: 3px; font-size: 11px; color: #8a93a6; }
-.empty { color: #c4c9d4; font-size: 12px; }
+.emp-unknown { background: var(--warning-bg); color: var(--warning); }
+.meta { margin-top: 4px; font-size: 12px; color: var(--text-2); }
+.empty { color: var(--text-3); font-size: 12px; }
 .sched-foot {
-  padding: 6px 12px; font-size: 11px; color: #9aa3b2;
-  background: #fafbfe; border-top: 1px solid #eef0f6;
+  padding: 8px var(--sp-2);
+  font-size: 12px; color: var(--text-2);
+  background: var(--gray-100);
+  border-top: 1px solid var(--line);
 }
-.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin: 0 3px 0 8px; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: var(--r-full); margin: 0 3px 0 8px; }
 
-/* 逐日说明卡片（左右滑动） */
-.dc-scroll {
-  display: flex; gap: 10px; overflow-x: auto;
-  padding: 4px 2px 8px; scroll-snap-type: x mandatory; scrollbar-width: thin;
+/* ============================================================
+   规则合规卡片
+   ============================================================ */
+.rule-card {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  overflow: hidden;
+  margin: 6px 0 2px;
+  box-shadow: var(--shadow-sm);
 }
-.dc-card {
-  flex: 0 0 76%; scroll-snap-align: center;
-  border: 1px solid var(--line); border-radius: 14px; padding: 10px 12px;
-  background: #fff; box-shadow: 0 2px 10px rgba(30, 55, 120, 0.05);
-}
-.dc-card.weekend { background: #fffaf0; border-color: #f3e2bd; }
-.dc-day { font-weight: 800; font-size: 15px; color: var(--text); margin-bottom: 7px; }
-.dc-shift + .dc-shift { margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 8px; }
-.dc-shift-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
-.dc-shift-name { font-size: 12px; font-weight: 700; color: #6b7280; }
-.dc-count {
-  font-size: 11px; font-weight: 700; color: var(--accent);
-  background: #eef2ff; border-radius: 999px; padding: 1px 8px;
-}
-.dc-meta { font-size: 11px; color: #8a93a6; margin-top: 2px; }
-
-/* 规则合规卡片 */
-.rule-card { border: 1px solid #e8eaf2; border-radius: 12px; overflow: hidden; margin: 6px 0 2px; }
-.rule-item { display: flex; gap: 8px; padding: 8px 10px; border-bottom: 1px solid #f2f3f8; font-size: 13px; }
-.rule-item:last-child { border-bottom: none; }
-.rule-item.fail { background: #fff8f8; }
-.rule-item.unknown { background: #fffcf5; }
-.rule-icon { font-size: 14px; line-height: 1.4; }
-.rule-body { flex: 1; min-width: 0; }
-.rule-title { color: #334155; line-height: 1.5; }
-.rule-title b { color: #1f2430; }
-.rule-status { float: right; margin-left: 6px; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
-.rule-status.pass { background: #dcfce7; color: #15803d; }
-.rule-status.fail { background: #fee2e2; color: #b91c1c; }
-.rule-status.unknown { background: #fef3c7; color: #b45309; }
-.rule-detail { font-size: 12px; color: #6b7280; margin-top: 3px; line-height: 1.55; }
-
-/* 欢迎页 */
-.hero { text-align: center; padding: 30px 8px 12px; }
-.hero-logo {
-  width: 64px; height: 64px; margin: 0 auto 14px;
-  border-radius: 20px;
-  background: var(--accent);
-  display: flex; align-items: center; justify-content: center;
-  font-size: 30px;
-  box-shadow: 0 8px 20px rgba(79, 110, 247, 0.25);
-}
-.hero h1 { font-size: 21px; color: var(--text); margin: 0 0 8px; letter-spacing: 0.2px; }
-.hero p { color: #8a93a6; font-size: 13px; line-height: 1.7; margin: 0 0 4px; }
-.hero .hero-sub { color: #b3bac7; font-size: 12px; margin-top: 8px; }
-.hero .hint { color: #b3bac7; font-size: 12px; margin-top: 20px; }
-
-/* 示例按钮：浅色圆角卡片 */
-div[data-testid="stElementContainer"][class*="st-key-example_"] button {
-  background: #f7f8fd;
-  border: 1px solid #e8ebf8;
-  border-radius: 14px;
+.rule-item {
+  display: flex; gap: 10px;
   padding: 10px 12px;
-  min-height: 44px;
+  border-bottom: 1px solid var(--line);
+  font-size: 14px;
+  border-left: 3px solid transparent;
+  transition: background var(--dur) var(--ease);
+}
+.rule-item:last-child { border-bottom: none; }
+.rule-item.pass { background: #ffffff; }
+.rule-item.fail { background: var(--danger-bg); border-left-color: var(--danger); }
+.rule-item.unknown { background: var(--warning-bg); border-left-color: var(--warning); }
+.rule-item:hover { background: var(--gray-100); }
+.rule-icon { font-size: 16px; line-height: 1.4; }
+.rule-body { flex: 1; min-width: 0; }
+.rule-title { color: var(--gray-900); line-height: 1.5; }
+.rule-title b { color: var(--text); font-weight: 700; }
+.rule-status {
+  float: right; margin-left: 6px;
+  padding: 1px 9px;
+  border-radius: var(--r-sm);
+  font-size: 12px; font-weight: 600;
+}
+.rule-status.pass { background: var(--success-bg); color: var(--success); }
+.rule-status.fail { background: var(--danger-bg); color: var(--danger); }
+.rule-status.unknown { background: var(--warning-bg); color: var(--warning); }
+.rule-detail { font-size: 12px; color: var(--text-2); margin-top: 3px; line-height: 1.55; }
+
+/* ============================================================
+   欢迎页
+   ============================================================ */
+.hero { text-align: center; padding: var(--sp-6) var(--sp-1) var(--sp-2); }
+.hero-logo {
+  position: relative;
+  width: 72px; height: 72px; margin: 0 auto var(--sp-2);
+  border-radius: var(--r-lg);
+  background: linear-gradient(135deg, var(--primary), var(--accent));
+  display: flex; align-items: center; justify-content: center;
+  font-size: 32px;
+  box-shadow: 0 12px 30px rgba(77, 107, 254, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+.hero-logo::after {
+  content: ""; position: absolute; inset: -10px;
+  border-radius: var(--r-lg);
+  background: linear-gradient(135deg, rgba(77, 107, 254, 0.18), rgba(139, 92, 246, 0.18));
+  filter: blur(16px); z-index: -1;
+}
+.hero h1 {
+  font-size: 24px; font-weight: 700;
+  margin: 0 0 var(--sp-2); letter-spacing: 0.3px;
+  background: linear-gradient(135deg, var(--primary-700), var(--accent));
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.hero p { color: var(--text-2); font-size: 14px; line-height: 1.75; margin: 0 0 4px; }
+.hero .hero-sub { color: var(--text-3); font-size: 12px; margin-top: var(--sp-1); }
+.hero .hint { color: var(--text-3); font-size: 12px; margin-top: var(--sp-3); }
+
+/* ============================================================
+   示例按钮（lg 48px）
+   ============================================================ */
+div[data-testid="stElementContainer"][class*="st-key-example_"] button {
+  position: relative;
+  background: var(--gray-100);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 12px 36px 12px 16px;
+  min-height: 48px;
   text-align: left;
+  font-size: 14px;
+  color: var(--text);
+  box-shadow: var(--shadow-sm);
+  transition: all var(--dur) var(--ease);
 }
 div[data-testid="stElementContainer"][class*="st-key-example_"] button:hover {
-  background: #eef2ff;
-  border-color: #c7d2fe;
+  background: var(--primary-soft);
+  border-color: var(--primary);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+}
+div[data-testid="stElementContainer"][class*="st-key-example_"] button::after {
+  content: "›"; position: absolute; right: 16px; top: 50%; transform: translateY(-50%);
+  color: var(--text-3); font-size: 20px; font-weight: 600;
+  transition: transform var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+div[data-testid="stElementContainer"][class*="st-key-example_"] button:hover::after {
+  transform: translate(2px, -50%); color: var(--primary);
 }
 
-/* 下载按钮 */
+/* ============================================================
+   下载按钮（线框变体）
+   ============================================================ */
 div[data-testid="stDownloadButton"] > button {
-  border-radius: 10px; border: 1px solid #d8defc; background: #f5f7ff;
-  color: var(--accent); font-weight: 600; font-size: 13px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--primary);
+  background: #ffffff;
+  color: var(--primary);
+  font-size: 14px; font-weight: 600;
+  min-height: 40px;
+  transition: all var(--dur) var(--ease);
+}
+div[data-testid="stDownloadButton"] > button:hover {
+  background: var(--primary-soft);
+  border-color: var(--primary-700);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
 }
 
-/* 数据对话框：豆包风格底部抽屉 */
+/* ============================================================
+   数据对话框（模态 16px）
+   ============================================================ */
 [data-testid="stDialog"] {
-  background: rgba(15, 23, 42, 0.45) !important;
-  backdrop-filter: blur(2px);
+  background: rgba(33, 37, 41, 0.45) !important;
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
 }
 [data-testid="stDialog"] > div {
   position: fixed !important;
   bottom: 0 !important;
   left: 50% !important;
   transform: translateX(-50%) !important;
-  width: min(430px, 100vw) !important;
+  width: min(480px, 100vw) !important;
   max-width: 100vw !important;
   max-height: 82dvh !important;
   margin: 0 !important;
   overflow: hidden !important;
-  border-radius: 24px 24px 0 0 !important;
+  border-radius: var(--r-lg) var(--r-lg) 0 0 !important;
   border: none !important;
   border-top: 1px solid var(--line) !important;
-  box-shadow: 0 -12px 40px rgba(16, 24, 40, 0.18) !important;
+  box-shadow: var(--shadow-lg) !important;
+  background: #ffffff;
 }
 [data-testid="stDialog"] > div::before {
-  content: "";
-  display: block;
-  width: 36px;
-  height: 4px;
-  border-radius: 999px;
-  background: #dfe3ee;
-  margin: 10px auto 2px;
-  flex-shrink: 0;
+  content: ""; display: block;
+  width: 38px; height: 5px; border-radius: var(--r-sm);
+  background: var(--gray-300);
+  margin: 11px auto 3px; flex-shrink: 0;
 }
 [data-testid="stDialog"] section {
-  display: flex !important;
-  flex-direction: column;
-  min-height: 0;
-  overflow: hidden !important;
+  display: flex !important; flex-direction: column;
+  min-height: 0; overflow: hidden !important;
 }
 [data-testid="stDialog"] section > div:last-child {
-  flex: 1 1 auto !important;
-  min-height: 0 !important;
-  overflow-y: auto !important;
+  flex: 1 1 auto !important; min-height: 0 !important; overflow-y: auto !important;
 }
 [data-testid="stDialog"] h2 {
-  font-size: 16px !important;
-  font-weight: 700 !important;
+  font-size: 16px !important; font-weight: 700 !important;
   color: var(--text) !important;
-  padding: 18px 20px 10px !important;
+  padding: var(--sp-3) var(--sp-3) var(--sp-1) !important;
   margin: 0 !important;
 }
 [data-testid="stDialog"] button[aria-label="Close"] {
-  width: 30px !important;
-  height: 30px !important;
-  border-radius: 50% !important;
-  background: #f1f3f9 !important;
+  width: 30px !important; height: 30px !important;
+  border-radius: var(--r-full) !important;
+  background: var(--gray-100) !important;
   border: none !important;
-  color: #6b7280 !important;
-  display: flex !important;
-  align-items: center;
-  justify-content: center;
+  color: var(--text-2) !important;
+  display: flex !important; align-items: center; justify-content: center;
+  transition: all var(--dur) var(--ease);
 }
 [data-testid="stDialog"] button[aria-label="Close"]:hover {
-  background: #e8ebf5 !important;
-  color: var(--accent) !important;
+  background: var(--primary-soft) !important;
+  color: var(--primary) !important;
 }
-[data-testid="stDialog"] section > button[aria-label="Close"] {
-  top: 16px !important;
-  right: 16px !important;
-}
+[data-testid="stDialog"] section > button[aria-label="Close"] { top: 16px !important; right: 16px !important; }
 [data-testid="stDialog"] [data-testid="stDataFrame"] { width: 100% !important; }
 
-/* 头部图标按钮统一样式 */
+/* ============================================================
+   头部图标按钮（40px 圆形按钮组）
+   ============================================================ */
 div[data-testid="stElementContainer"].st-key-new_chat button,
 div[data-testid="stElementContainer"].st-key-data_btn button {
-  width: 40px !important;
-  height: 40px !important;
-  min-height: 40px !important;
+  width: 40px !important; height: 40px !important; min-height: 40px !important;
   padding: 0 !important;
-  border-radius: 14px !important;
+  border-radius: var(--r-sm) !important;
   border: 1px solid var(--line) !important;
-  background: #fff !important;
-  color: #4b5563 !important;
-  display: flex !important;
-  align-items: center;
-  justify-content: center;
-  box-shadow: none !important;
+  background: rgba(255, 255, 255, 0.80) !important;
+  color: var(--text-2) !important;
+  display: flex !important; align-items: center; justify-content: center;
+  box-shadow: var(--shadow-sm) !important;
+  transition: all var(--dur) var(--ease) !important;
 }
 div[data-testid="stElementContainer"].st-key-new_chat button:hover,
 div[data-testid="stElementContainer"].st-key-data_btn button:hover {
-  background: #f5f7ff !important;
-  border-color: #c7d2fe !important;
-  color: var(--accent) !important;
+  background: var(--primary-soft) !important;
+  border-color: var(--primary) !important;
+  color: var(--primary) !important;
+  transform: translateY(-1px);
+}
+
+/* ============================================================
+   为什么这样安排：排班逻辑
+   ============================================================ */
+.why-title {
+  font-weight: 600; color: var(--text);
+  font-size: 16px; margin: 4px 0 var(--sp-1);
+}
+.why-hint { font-weight: 400; color: var(--text-3); font-size: 12px; margin-left: var(--sp-1); }
+.why-steps {
+  display: flex; flex-direction: row; gap: var(--sp-1);
+  overflow-x: auto; padding: 2px 2px var(--sp-1); margin-bottom: var(--sp-1);
+  scroll-snap-type: x mandatory; -webkit-overflow-scrolling: touch;
+}
+.why-steps::-webkit-scrollbar { height: 0; }
+.why-step {
+  flex: 0 0 44%; min-width: 150px; scroll-snap-align: start;
+  background: linear-gradient(180deg, #ffffff, var(--gray-100));
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: var(--sp-2);
+  box-shadow: var(--shadow-sm);
+  transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.why-step:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); }
+.why-step .ws-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 36px; height: 36px;
+  border-radius: var(--r-sm);
+  background: linear-gradient(135deg, var(--primary-soft), var(--accent-soft));
+  font-size: 20px; margin-bottom: var(--sp-1);
+}
+.why-step .ws-title { font-weight: 600; color: var(--text); font-size: 14px; margin-bottom: 4px; }
+.why-step .ws-text { color: var(--text-2); font-size: 12px; line-height: 1.6; }
+.why-facts { display: flex; flex-wrap: wrap; gap: var(--sp-1); margin-bottom: var(--sp-1); }
+.why-fact {
+  background: var(--primary-soft);
+  border: 1px solid var(--info-line);
+  color: var(--primary-700);
+  border-radius: var(--r-sm);
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.why-banner {
+  border-radius: var(--r-md);
+  padding: 12px var(--sp-2);
+  font-size: 14px;
+  line-height: 1.6;
+  margin-bottom: 2px;
+  font-weight: 500;
+}
+.why-banner.ok { background: var(--success-bg); border: 1px solid var(--success-line); color: var(--success); }
+.why-banner.warn { background: var(--warning-bg); border: 1px solid var(--warning-line); color: var(--warning); }
+.why-banner.err { background: var(--danger-bg); border: 1px solid var(--danger-line); color: var(--danger); }
+
+/* ============================================================
+   面板内部间距 / 折叠面板
+   ============================================================ */
+[data-testid="stChatMessageContent"] [data-testid="stExpander"] [data-testid="stVerticalBlock"] { gap: 4px !important; }
+[data-testid="stChatMessageContent"] [data-testid="stExpander"] [data-testid="stExpander"] { margin-top: 2px !important; }
+[data-testid="stExpander"] summary {
+  padding: 6px 0 !important;
+  font-weight: 600; color: var(--text); font-size: 14px;
+}
+
+/* ============================================================
+   页签
+   ============================================================ */
+[data-testid="stTabs"] [data-baseweb="tab-list"] {
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 6px; margin-bottom: 8px;
+}
+[data-testid="stTabs"] [data-baseweb="tab"] {
+  border-radius: var(--r-sm);
+  padding: 6px 14px;
+  font-size: 14px; font-weight: 600;
+  color: var(--text-2); background: var(--gray-100);
+  transition: all var(--dur) var(--ease);
+}
+[data-testid="stTabs"] [data-baseweb="tab"]:hover { background: var(--primary-soft); color: var(--primary); }
+[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
+  background: linear-gradient(135deg, var(--primary), var(--accent));
+  color: #fff;
+  box-shadow: 0 4px 12px rgba(77, 107, 254, 0.30);
+}
+
+/* ============================================================
+   特殊情况说明
+   ============================================================ */
+.special-card { display: flex; flex-direction: column; gap: var(--sp-1); }
+.special-row {
+  display: flex; gap: 12px; align-items: flex-start;
+  background: #ffffff;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 12px var(--sp-2);
+  box-shadow: var(--shadow-sm);
+}
+.special-row .sp-icon {
+  width: 32px; height: 32px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: var(--r-sm);
+  background: linear-gradient(135deg, var(--primary-soft), var(--accent-soft));
+  font-size: 16px; flex-shrink: 0;
+}
+.special-row .sp-title { font-weight: 600; color: var(--text); font-size: 14px; margin-bottom: 3px; }
+.special-row .sp-text { color: var(--text-2); font-size: 12px; line-height: 1.6; }
+
+/* ============================================================
+   侧边栏（毛玻璃 260px）
+   ============================================================ */
+[data-testid="stSidebar"] {
+  width: 260px !important;
+  background: rgba(255, 255, 255, 0.55) !important;
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+  border-right: 1px solid rgba(0, 0, 0, 0.08);
+}
+[data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+  padding: var(--sp-3) var(--sp-2);
+}
+.sb-brand { display: flex; align-items: center; gap: 12px; margin-bottom: var(--sp-2); }
+.sb-logo {
+  width: 40px; height: 40px;
+  border-radius: var(--r-md);
+  background: linear-gradient(135deg, var(--primary), var(--accent));
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px; color: #fff;
+  box-shadow: 0 6px 16px rgba(77, 107, 254, 0.30);
+}
+.sb-name { font-size: 16px; font-weight: 700; color: var(--text); line-height: 1.4; }
+.sb-sub { font-size: 12px; color: var(--text-3); }
+.sb-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 12px;
+  border-radius: var(--r-sm);
+  font-size: 12px; font-weight: 600;
+}
+.sb-pill.on { background: var(--success-bg); color: var(--success); }
+.sb-pill.off { background: var(--gray-200); color: var(--text-2); }
+[data-testid="stSidebar"] hr {
+  border-color: var(--line);
+  margin: var(--sp-2) 0;
+}
+[data-testid="stSidebar"] div[data-testid="stButton"] > button {
+  width: 100%;
+  justify-content: flex-start;
+  text-align: left;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.70);
+  color: var(--text-2);
+  font-size: 14px;
+  font-weight: 500;
+  min-height: 40px;
+}
+[data-testid="stSidebar"] div[data-testid="stButton"] > button:hover {
+  background: var(--primary-soft);
+  border-color: var(--primary);
+  color: var(--primary);
+  transform: none;
+}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
+  color: var(--text-3);
+  font-size: 12px;
 }
 </style>
 """
 
+
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "employees" not in st.session_state:
+    st.session_state.employees = copy.deepcopy(EMPLOYEES)
 
 
 def _emp_chip(eid: str) -> str:
@@ -552,37 +922,6 @@ def _build_schedule_html(schedule: Schedule, title: str = "本周排班表") -> 
     )
 
 
-def _build_day_cards_html(schedule: Schedule) -> str:
-    """把每周排班做成一天一张卡片，可左右滑动查看。"""
-    cards: List[str] = []
-    for day in DAYS:
-        shifts_html: List[str] = []
-        for shift in SHIFTS:
-            ids = schedule.get(day, shift)
-            if not ids:
-                shifts_html.append(
-                    f'<div class="dc-shift"><div class="dc-shift-head">'
-                    f'<span class="dc-shift-name">{shift} {SHIFT_TIMES[shift]}</span>'
-                    f'<span class="dc-count">未安排</span></div></div>'
-                )
-                continue
-            chips = "".join(_emp_chip(eid) for eid in ids)
-            n, manager, drink, cashier = _skill_counts(ids)
-            shifts_html.append(
-                f'<div class="dc-shift">'
-                f'<div class="dc-shift-head">'
-                f'<span class="dc-shift-name">{shift} {SHIFT_TIMES[shift]}</span>'
-                f'<span class="dc-count">{n} 人</span>'
-                f'</div>'
-                f'<div class="dc-emps">{chips}</div>'
-                f'<div class="dc-meta">店长 {manager} · 饮品 {drink} · 收银 {cashier}</div>'
-                f'</div>'
-            )
-        cls = " weekend" if day in ("周六", "周日") else ""
-        cards.append(f'<div class="dc-card{cls}"><div class="dc-day">📅 {day}</div>{"".join(shifts_html)}</div>')
-    return f'<div class="dc-scroll">{"".join(cards)}</div>'
-
-
 def _build_rule_html(checks) -> str:
     items: List[str] = []
     for c in checks:
@@ -628,21 +967,51 @@ def _schedule_csv(schedule: Schedule) -> bytes:
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
 
 
-def _build_explanation_sections(schedule: Schedule, checks, explanation: Dict[str, str]) -> Dict[str, str]:
-    """把解释内容整理成易读的卡片与列表。"""
-    daily = _build_day_cards_html(schedule)
+def _build_logic_html(explanation: Dict[str, object]) -> str:
+    """把排班逻辑步骤与关键数据渲染成卡片。"""
+    steps = explanation["logic_steps"]
+    step_html = "".join(
+        f'<div class="why-step"><div class="ws-icon">{s["icon"]}</div>'
+        f'<div class="ws-body"><div class="ws-title">{s["title"]}</div>'
+        f'<div class="ws-text">{s["text"]}</div></div></div>'
+        for s in steps
+    )
+    facts = "".join(f'<span class="why-fact">{f}</span>' for f in explanation["facts"])
+    return (
+        f'<div class="why-title">🧭 排班逻辑<span class="why-hint">左右滑动查看</span></div>'
+        f'<div class="why-steps">{step_html}</div>'
+        f'<div class="why-facts">{facts}</div>'
+    )
 
-    rule_lines: List[str] = []
-    for c in checks:
-        icon = "✅" if c.status == "通过" else ("❌" if c.status == "违反" else "⚠️")
-        rule_lines.append(f"- {icon} **{c.rule_id}**：{c.attribution}")
 
-    why_lines = [f"- {ln}" for ln in explanation["why_not"].split("\n") if ln.strip()]
+def _build_rule_banner_html(checks, rules_summary: str) -> str:
+    """规则检查结果横幅。"""
+    if any(c.status == "违反" for c in checks):
+        cls, icon = "err", "❌"
+    elif any(c.status == "无法判断" for c in checks):
+        cls, icon = "warn", "⚠️"
+    else:
+        cls, icon = "ok", "✅"
+    return f'<div class="why-banner {cls}">{icon} {rules_summary}</div>'
 
+
+def _build_special_html(explanation: Dict[str, object]) -> str:
+    """特殊情况说明：结构化卡片。"""
+    rows = "".join(
+        f'<div class="special-row"><div class="sp-icon">{n["icon"]}</div>'
+        f'<div class="sp-body"><div class="sp-title">{n["title"]}</div>'
+        f'<div class="sp-text">{n["text"]}</div></div></div>'
+        for n in explanation["special_notes"]
+    )
+    return f'<div class="special-card">{rows}</div>'
+
+
+def _build_explanation_sections(schedule: Schedule, checks, explanation: Dict[str, object]) -> Dict[str, str]:
+    """把解释内容整理成易读的卡片。"""
     return {
-        "daily": daily,
-        "rules": "**规则依据**\n\n" + "\n".join(rule_lines),
-        "why_not": "**员工情况说明**\n\n" + "\n".join(why_lines) if why_lines else "**员工情况说明**\n\n所有员工均已按规则参与排班。",
+        "logic_html": _build_logic_html(explanation),
+        "rule_banner": _build_rule_banner_html(checks, explanation["rules_summary"]),
+        "special_html": _build_special_html(explanation),
     }
 
 
@@ -680,7 +1049,7 @@ def _help_reply_content() -> str:
         "- 「检查排班」可直接粘贴已有排班，每行一个班次：`周一早班：E01,E02,E03,E04`\n"
         "- 支持指定人数与排除员工：`周六晚班安排 6 人，不要安排 E03`\n"
         "- 右上角「📊 数据」可随时查看规则与员工数据\n\n"
-        "所有排班与规则判断均由本地规则引擎完成，依据仅来自题目规则 R-01~R-09 与员工数据。"
+        "所有排班与规则判断均由本地规则引擎完成，依据仅来自题目规则 R-01～R-09 与员工数据。"
     )
 
 
@@ -719,18 +1088,34 @@ def _generate_reply(text: str) -> dict:
     notes = list(notes)
     notes.insert(0, "✅ 已用大模型解析需求（仅理解意图，排班与规则判断由规则引擎完成）" if parse_mode == "llm" else "ℹ️ 本地解析模式（未使用大模型），排班与规则判断由规则引擎完成")
 
+    # 应用请假/不可用更新：更新会话内的员工数据，后续排班持续生效
+    employees = st.session_state.employees
+    if intent.leave_updates:
+        employees = copy.deepcopy(employees)
+        emp_by_id = {e.emp_id: e for e in employees}
+        for upd in intent.leave_updates:
+            emp = emp_by_id.get(upd["emp"])
+            if emp is None:
+                notes.append(f"员工 {upd['emp']} 不在数据中，无法更新请假信息")
+                continue
+            days = upd["days"] or list(DAYS)
+            emp.available_days = [d for d in emp.available_days if d not in days]
+            emp.leave_days = sorted(set(emp.leave_days) | set(days))
+            notes.append(f"已更新员工数据：{upd['emp']} 请假（{'、'.join(days)}），相关日期不再排班")
+        st.session_state.employees = employees
+
     counts = default_min_counts()
     for (day, shift), n in intent.min_counts.items():
         counts[(DAY_INDEX[day], SHIFT_INDEX[shift])] = n
 
-    result = solve_schedule(EMPLOYEES, RULES, min_counts=counts, exclude=intent.exclude)
+    result = solve_schedule(employees, RULES, min_counts=counts, exclude=intent.exclude)
 
     summary = ("✅ " if result.feasible else "⚠️ ") + result.message
     scope = "、".join(intent.days)
     exclude = "、".join(intent.exclude) if intent.exclude else "无"
     summary += f"\n\n📅 排班范围：{scope}　｜　🚫 排除员工：{exclude}"
 
-    explanation = build_schedule_explanation(result.schedule, EMPLOYEES, result.checks)
+    explanation = build_schedule_explanation(result.schedule, employees, result.checks)
     sections = _build_explanation_sections(result.schedule, result.checks, explanation)
 
     return {
@@ -740,9 +1125,9 @@ def _generate_reply(text: str) -> dict:
         "notes": notes,
         "table": _build_schedule_html(result.schedule),
         "checks": _build_rule_html(result.checks),
-        "daily": sections["daily"],
-        "rules": sections["rules"],
-        "why_not": sections["why_not"],
+        "logic_html": sections["logic_html"],
+        "rule_banner": sections["rule_banner"],
+        "special_html": sections["special_html"],
         "csv": _schedule_csv(result.schedule),
     }
 
@@ -781,6 +1166,16 @@ def _process_reply(text: str, toggle: str) -> dict:
     special = _detect_special_query(text)
     if special:
         return special
+    if not looks_meaningful(text):
+        return {
+            "role": "assistant",
+            "kind": "text",
+            "content": (
+                "抱歉，我没理解你的需求。请用一句话描述，例如：\n\n"
+                "- 生成排班：`帮我安排周一到周日的排班，各班按规则最低人数安排`\n"
+                "- 检查排班：先切换到「检查排班」，再粘贴 `周一早班：E01,E02,E03,E04`"
+            ),
+        }
 
     auto_switched = False
     if toggle == "生成排班" and _SCHEDULE_LIKE_RE.search(text):
@@ -805,12 +1200,14 @@ def _render_generate(msg: dict, idx: int) -> None:
         key=f"csv_{idx}",
         use_container_width=True,
     )
-    st.markdown("**📋 规则合规报告**")
-    st.markdown(msg["checks"], unsafe_allow_html=True)
     with st.expander("📝 为什么这样安排"):
-        st.markdown(msg["daily"], unsafe_allow_html=True)
-        st.markdown(msg["rules"])
-        st.markdown(msg["why_not"])
+        st.markdown(msg["logic_html"], unsafe_allow_html=True)
+        st.markdown(msg["rule_banner"], unsafe_allow_html=True)
+        tab_detail, tab_special = st.tabs(["📋 规则校验明细", "ℹ️ 特殊情况说明"])
+        with tab_detail:
+            st.markdown(msg["checks"], unsafe_allow_html=True)
+        with tab_special:
+            st.markdown(msg["special_html"], unsafe_allow_html=True)
 
 
 def _render_check(msg: dict, idx: int) -> None:
@@ -855,7 +1252,7 @@ def _render_welcome() -> Optional[Tuple[str, str]]:
 
 
 def _render_data_panel() -> None:
-    st.markdown("**📋 排班规则 R-01~R-09**")
+    st.markdown("**📋 排班规则 R-01～R-09**")
     for r in RULES:
         st.markdown(f"- **{r.rule_id}**　{r.description}")
     st.divider()
@@ -889,52 +1286,66 @@ def _render_header() -> None:
             unsafe_allow_html=True,
         )
     with c2:
-        if st.button("", key="new_chat", help="开启新对话", icon=":material/chat_bubble:", use_container_width=True):
+        if st.button("", key="new_chat", icon=":material/chat_bubble:", use_container_width=True):
             st.session_state.messages = []
+            st.session_state.employees = copy.deepcopy(EMPLOYEES)
     with c3:
-        if st.button("", key="data_btn", help="数据与规则", icon=":material/analytics:", use_container_width=True):
+        if st.button("", key="data_btn", icon=":material/analytics:", use_container_width=True):
             _show_data_dialog()
 
 
-def _render_input_bar() -> Tuple[bool, str, str]:
-    # 提交后延迟清空输入框（组件实例化前重置，避免直接修改已实例化组件的状态）
-    if st.session_state.pop("clear_input", False):
-        st.session_state.pop("chat_text", None)
-
-    current_mode = st.session_state.get("chat_mode", st.session_state.get("last_mode", "生成排班"))
-    placeholder = (
-        "例如：帮我安排周一到周日的排班，各班按规则最低人数安排"
-        if current_mode == "生成排班"
-        else "粘贴排班文本，每行一个班次：\n周一早班：E01,E02,E03,E04\n周一晚班：E02,E07,E11,E18"
-    )
-    text = st.text_area(
-        "输入",
-        key="chat_text",
-        height=64,
-        placeholder=placeholder,
-        label_visibility="collapsed",
-    )
-    c1, c2 = st.columns([3, 1], vertical_alignment="center")
-    with c1:
-        mode = st.radio(
-            "功能",
-            options=["生成排班", "检查排班"],
-            format_func=lambda x: {"生成排班": "📝 生成排班", "检查排班": "🔍 检查排班"}[x],
-            index=0 if st.session_state.get("last_mode", "生成排班") == "生成排班" else 1,
-            key="chat_mode",
-            horizontal=True,
-            label_visibility="hidden",
+def _render_sidebar() -> None:
+    """企业级侧边栏：品牌、状态与快捷入口。"""
+    api_key = os.getenv("DEEPSEEK_API_KEY", "")
+    pill_class = "on" if api_key else "off"
+    pill_text = "✨ DeepSeek 在线" if api_key else "🔌 本地解析"
+    with st.sidebar:
+        st.markdown(
+            '<div class="sb-brand">'
+            '<div class="sb-logo">📅</div>'
+            '<div><div class="sb-name">智能排班助手</div>'
+            '<div class="sb-sub">Smart Scheduler</div></div></div>',
+            unsafe_allow_html=True,
         )
-    with c2:
-        sent = st.button("发送", key="send_btn", icon=":material/send:", use_container_width=True)
+        st.markdown(f'<span class="sb-pill {pill_class}">{pill_text}</span>', unsafe_allow_html=True)
+        st.markdown("---")
+        if st.button("📊 查看规则与员工数据", key="sb_data", use_container_width=True):
+            _show_data_dialog()
+        if st.button("🧹 新建对话", key="sb_new", use_container_width=True):
+            st.session_state.messages = []
+            st.session_state.employees = copy.deepcopy(EMPLOYEES)
+            st.rerun()
+        st.caption("判断依据仅来自题目规则 R-01～R-09 与员工数据。")
+
+
+def _render_input_bar() -> Tuple[bool, str, str]:
+    current_mode = st.session_state.get("chat_mode", st.session_state.get("last_mode", "生成排班"))
+    mode = st.radio(
+        "功能",
+        options=["生成排班", "检查排班"],
+        format_func=lambda x: {"生成排班": "📝 生成排班", "检查排班": "🔍 检查排班"}[x],
+        index=0 if st.session_state.get("last_mode", "生成排班") == "生成排班" else 1,
+        key="chat_mode",
+        horizontal=True,
+        label_visibility="hidden",
+    )
     if mode == "检查排班":
         st.caption("支持多行粘贴，每行格式：周X早班/晚班：员工ID（如：周一早班：E01,E02,E03,E04）")
-    return sent, text, mode
+    placeholder = (
+        "例如：帮我安排周一到周日的排班，各班按规则最低人数安排"
+        if mode == "生成排班"
+        else "粘贴排班文本，每行一个班次：\n周一早班：E01,E02,E03,E04"
+    )
+    prompt = st.chat_input(placeholder, key="chat_prompt")
+    if prompt and prompt.strip():
+        return True, prompt, mode
+    return False, "", mode
 
 
 def main() -> None:
     st.markdown(_CSS, unsafe_allow_html=True)
 
+    _render_sidebar()
     _render_header()
 
     messages_area = st.container(key="messages_area")
@@ -951,7 +1362,6 @@ def main() -> None:
             _render_messages()
             reply = _process_reply(text, mode)
             st.session_state.messages[-1] = reply
-            st.session_state["clear_input"] = True
             st.rerun()
         elif st.session_state.messages:
             _render_messages()
@@ -966,6 +1376,18 @@ def main() -> None:
                 reply = _process_reply(text, mode)
                 st.session_state.messages[-1] = reply
                 st.rerun()
+
+    # 消息区自动滚动到底部（高度为 0 的透明组件，仅执行滚动脚本）
+    st.iframe(
+        "<script>"
+        "(function(){"
+        "  var el = window.parent.document.querySelector('.st-key-messages_area');"
+        "  if (el) { el.scrollTo({top: el.scrollHeight, behavior: 'smooth'}); }"
+        "})();"
+        f"//{time.time()}"
+        "</script>",
+        height=1,
+    )
 
 
 if __name__ == "__main__":

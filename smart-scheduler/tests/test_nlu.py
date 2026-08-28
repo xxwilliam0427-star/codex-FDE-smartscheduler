@@ -33,6 +33,19 @@ def test_local_parse_default_days():
     assert intent.notes  # 有“未识别日期”提示
 
 
+def test_meaningless_input_returns_clarify():
+    for text in ("1", "你好", "abc", "？？？"):
+        intent = nlu.parse_local(text)
+        assert intent.action == "clarify", text
+        assert not intent.days
+
+
+def test_meaningful_input_not_clarify():
+    assert nlu.parse_local("帮我排个班").action == "generate"
+    assert nlu.parse_local("周六晚班6人").action == "generate"
+    assert nlu.parse_local("周一早班：E01,E02,E03,E04").action == "check"
+
+
 def test_local_parse_check_mode():
     text = "帮我检查一下这个排班\n周一早班：E01,E02,E03,E04\n周一晚班：E02,E07,E11,E18"
     intent = nlu.parse_local(text)
@@ -43,6 +56,23 @@ def test_local_parse_check_mode():
 def test_local_parse_exclude():
     intent = nlu.parse_local("周一到周日排班，不要安排E03")
     assert intent.exclude == ["E03"]
+
+
+def test_parse_local_leave_update_whole_week():
+    intent = nlu.parse_local("搞错了，e03这周请假来不了")
+    assert intent.action == "generate"
+    assert intent.action != "clarify"
+    assert intent.leave_updates == [{"emp": "E03", "days": nlu.DAYS}]
+
+
+def test_parse_local_leave_update_specific_day():
+    intent = nlu.parse_local("E03周三请假，重新排一下")
+    assert intent.leave_updates == [{"emp": "E03", "days": ["周三"]}]
+
+
+def test_parse_local_leave_update_case_insensitive():
+    intent = nlu.parse_local("e03来不了")
+    assert intent.leave_updates == [{"emp": "E03", "days": nlu.DAYS}]
 
 
 def test_parse_schedule_text():
@@ -100,6 +130,29 @@ def test_parse_intent_llm_mode(monkeypatch):
     assert intent.exclude == ["E03"]
 
 
+def test_parse_intent_llm_leave_updates(monkeypatch):
+    def fake_call_llm_json(prompt, api_key, base_url, model):
+        return {
+            "action": "generate",
+            "days": nlu.DAYS,
+            "min_counts": {},
+            "exclude": [],
+            "leave_updates": [{"emp": "e03", "days": ["周三"]}],
+            "schedule_text": None,
+        }
+
+    monkeypatch.setattr(nlu, "call_llm_json", fake_call_llm_json)
+    intent, mode, notes = nlu.parse_intent(
+        "E03周三请假",
+        employees_summary_text(),
+        rules_summary_text(),
+        api_key="sk-test",
+        use_llm=True,
+    )
+    assert mode == "llm"
+    assert intent.leave_updates == [{"emp": "E03", "days": ["周三"]}]
+
+
 def test_parse_intent_llm_fallback_on_bad_json(monkeypatch):
     def bad_call_llm_json(*args, **kwargs):
         raise ValueError("bad json")
@@ -115,3 +168,20 @@ def test_parse_intent_llm_fallback_on_bad_json(monkeypatch):
     assert mode == "local"
     assert notes
     assert intent.min_counts[("周六", "晚班")] == 6
+
+
+def test_parse_intent_meaningless_skips_llm(monkeypatch):
+    def should_not_call(*args, **kwargs):
+        raise AssertionError("无意义输入不应调用大模型")
+
+    monkeypatch.setattr(nlu, "call_llm_json", should_not_call)
+    intent, mode, notes = nlu.parse_intent(
+        "1",
+        employees_summary_text(),
+        rules_summary_text(),
+        api_key="sk-test",
+        use_llm=True,
+    )
+    assert intent.action == "clarify"
+    assert mode == "local"
+    assert notes
