@@ -341,32 +341,46 @@ div[data-testid="stButton"] > button:active { transform: translateY(0); box-shad
 [data-testid="stChatMessageContent"][aria-label="Chat message from user"] div { color: #fff; }
 
 /* ============================================================
-   输入区（玻璃卡片 / 12px 16px 内边距 / 主色聚焦光环）
+   输入区（透明底 / 独立输入框 / 主色聚焦光环）
    ============================================================ */
 .st-key-input_area {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 2px 0 6px;
+  margin-top: 2px;
+  gap: 6px !important;
+}
+.st-key-input_area [data-testid="stChatInput"] {
   background: rgba(255, 255, 255, 0.92);
   border: 1px solid var(--line);
   border-radius: var(--r-md);
-  padding: 10px 12px 12px;
-  box-shadow: var(--shadow-md);
-  margin-top: 6px;
+  box-shadow: var(--shadow-sm);
+  padding: 2px;
   transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
-.st-key-input_area:focus-within {
+.st-key-input_area [data-testid="stChatInput"]:focus-within {
   border-color: var(--primary);
-  box-shadow: 0 0 0 3px rgba(77, 107, 254, 0.25);
+  box-shadow: 0 0 0 3px rgba(77, 107, 254, 0.22);
 }
 .st-key-input_area textarea {
   border: none !important;
   background: transparent !important;
   box-shadow: none !important;
   resize: none;
-  font-size: 15px;
-  line-height: 1.55;
-  padding: 12px 16px;
+  font-size: 14px;
+  line-height: 1.45;
+  padding: 8px 12px;
 }
 .st-key-input_area textarea::placeholder { color: var(--gray-400); }
-.st-key-input_area .stChatInput { background: transparent; border: none; box-shadow: none; padding: 0; }
+.st-key-input_area [data-testid="stCaptionContainer"] p {
+  margin: 2px 4px 0 !important;
+  font-size: 12px !important;
+  line-height: 1.45 !important;
+}
+.st-key-input_area [data-testid="stCaptionContainer"] {
+  margin-bottom: 0 !important;
+}
 div[data-testid="stChatInputSubmitButton"] {
   background: linear-gradient(135deg, var(--primary), var(--accent)) !important;
   border: none !important;
@@ -389,8 +403,8 @@ div[data-testid="stChatInputSubmitButton"]:hover {
 [data-testid="stRadio"] {
   background: var(--gray-100);
   border-radius: var(--r-sm);
-  padding: 4px;
-  height: 40px;
+  padding: 3px;
+  height: 34px;
   display: flex;
   align-items: center;
   border: 1px solid var(--line);
@@ -398,8 +412,8 @@ div[data-testid="stChatInputSubmitButton"]:hover {
 [data-testid="stRadio"] [role="radiogroup"] { gap: 4px; width: 100%; min-height: 0 !important; padding: 0 !important; }
 [data-testid="stRadio"] label {
   border-radius: var(--r-sm);
-  font-size: 14px; font-weight: 500;
-  padding: 0 12px !important; height: 30px;
+  font-size: 13px; font-weight: 500;
+  padding: 0 10px !important; height: 26px;
   background: transparent; color: var(--text-2);
   margin: 0; flex: 1; justify-content: center; min-height: 0 !important;
   display: flex; align-items: center;
@@ -1330,11 +1344,11 @@ def _render_input_bar() -> Tuple[bool, str, str]:
         label_visibility="hidden",
     )
     if mode == "检查排班":
-        st.caption("支持多行粘贴，每行格式：周X早班/晚班：员工ID（如：周一早班：E01,E02,E03,E04）")
+        st.caption("支持多行粘贴，每行一个班次")
     placeholder = (
-        "例如：帮我安排周一到周日的排班，各班按规则最低人数安排"
+        "例如：帮我安排周一到周日的排班"
         if mode == "生成排班"
-        else "粘贴排班文本，每行一个班次：\n周一早班：E01,E02,E03,E04"
+        else "粘贴排班文本，如：周一早班：E01"
     )
     prompt = st.chat_input(placeholder, key="chat_prompt")
     if prompt and prompt.strip():
